@@ -26,6 +26,12 @@ import os
 import cv2 as cv
 import pandas as pd
 
+def split_train_val_indices(train_array):
+    train_index = np.random.permutation(train_array)
+    train, val = np.array_split(train_index, 2)
+    return train, val
+
+
 BATCH_SIZE = 16
 
 labels = []
@@ -33,13 +39,15 @@ data = []
 
 PATH_TO_REAL_DATASET='Datasets/NaturalFaces/Images/'
 PATH_TO_ARTIFICIAL_DATASET='Datasets/ArtificialFaces'
-files = np.array(os.listdir(PATH_TO_ARTIFICIAL_DATASET))
+PATH_TO_JOIN = PATH_TO_ARTIFICIAL_DATASET
+files = np.array(os.listdir(PATH_TO_JOIN))
 random.shuffle(files)
 
-NUMBER_OF_FILES = len(files[:40])
+
+NUMBER_OF_FILES = len(files[:300])
 
 print("Extracting each data into respective label folders....")
-for idx, path in enumerate(files[:40]):
+for idx, path in enumerate(files[:300]):
     label =' '
     if(path.endswith('Mask.jpg')):
         label = 'withmask'
@@ -47,7 +55,7 @@ for idx, path in enumerate(files[:40]):
         label = "withoutmask"
     #pre_str = path.split('.')[0].split('_')[-2:]
     #label = pre_str[0]+pre_str[1]
-    face = cv.imread(os.path.join(PATH_TO_ARTIFICIAL_DATASET, path))
+    face = cv.imread(os.path.join(PATH_TO_JOIN, path))
     face = cv.resize(face, (224, 224))
     face = img_to_array(face)
     face = preprocess_input(face)
@@ -61,7 +69,7 @@ labels = lb.fit_transform(labels)
 
 aug = ImageDataGenerator(
     zoom_range=0.1,
-    rotation_range=25,
+    rotation_range=15,
     width_shift_range=0.1,
     height_shift_range=0.1,
     shear_range=0.15,
@@ -76,28 +84,32 @@ n_splits = 2
 n_repeats = 5
 rskf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state =rs)
 true_labels = []
-NUM_EPOCHS = 1
-NUM_UNFREEZED_LAYERS = 1
+NUM_EPOCHS = 3
+NUM_UNFREEZED_LAYERS = 2
 
 #macierz z wynikami |WARSTWA|FOLD|ETYKIETA|PREDYKCJA|
-predictions = np.zeros((NUM_UNFREEZED_LAYERS, n_splits * n_repeats, NUMBER_OF_FILES // 4), dtype=int)
-true_labels = np.zeros((NUM_UNFREEZED_LAYERS, n_splits * n_repeats, NUMBER_OF_FILES // 4), dtype=int)
+#predictions = np.zeros((NUM_UNFREEZED_LAYERS, n_splits * n_repeats, NUMBER_OF_FILES // 2), dtype=int)
+predictions = np.zeros((n_splits * n_repeats, NUMBER_OF_FILES // 2), dtype=int)
+#true_labels = np.zeros((NUM_UNFREEZED_LAYERS, n_splits * n_repeats, NUMBER_OF_FILES // 2), dtype=int)
+true_labels = np.zeros((n_splits * n_repeats, NUMBER_OF_FILES // 2), dtype=int)
+acc_score = np.zeros(10, dtype=int)
 
 
 for index in range(0,NUM_UNFREEZED_LAYERS):
     print(f"{index}")
     for fold_id, (train_index, test_index) in enumerate(rskf.split(data, labels)):
-
         print(f"Fold Number: {fold_id}")
         #podział na zbio walidacjny i testowy w proporcjach 50|50
-        X_val, X_test, y_val, y_test = train_test_split(data[test_index], labels[test_index],
-                                                               test_size=0.5, random_state=rs)
-
-        #labels = to_categorical(labels, dtype="int32")
+        #tu ma byc x_train i x_val
+        #zwrocic same indeksy train_index podzielony na wlasicywi train index i val index wlasna funkcja, losuj polowe bez zwracania
+        train_index, val_index = split_train_val_indices(train_index)
         X_train = data[train_index]
-        Y_train, Y_test, Y_val = to_categorical(labels[train_index], dtype="int32"),\
-                          to_categorical(labels[y_test], dtype="int32"),\
-                          to_categorical(labels[y_val], dtype="int32")
+        X_val = data[val_index]
+        X_test = data[test_index]
+        #labels = to_categorical(labels, dtype="int32")
+        Y_train,  Y_val = to_categorical(labels[train_index], dtype="int32"),\
+                          to_categorical(labels[val_index], dtype="int32")
+        #                  to_categorical(labels[y_val], dtype="int32")
         #Y_train, Y_test = labels[train_index], labels[test_index]
         baseModel = MobileNetV2(weights="imagenet", include_top=False,
                                 input_tensor=Input(shape=(224, 224, 3)))
@@ -119,25 +131,34 @@ for index in range(0,NUM_UNFREEZED_LAYERS):
         model.compile(loss="binary_crossentropy", optimizer=opt,
                       metrics=["accuracy"])
 
-        csv_logger = CSVLogger('training_log_1.csv',append=True)
+        csv_logger = CSVLogger(f'Results\\FoldResults\\training_log_{index}_fold_{fold_id}.csv', append=True)
         print("[INFO] training head...")
         H = model.fit(
             aug.flow(X_train, Y_train, batch_size=16),
             steps_per_epoch=len(X_train) // 16,
             validation_data=(X_val, Y_val),
-            validation_steps=len(X_val) // 16,
+            #validation_steps=len(X_val) // 16,
             callbacks=[csv_logger],
             epochs=NUM_EPOCHS)
 
         predicts = model.predict(X_test)
         predicts_labels = np.argmax(predicts, axis=-1)
+        print(accuracy_score(labels[test_index], predicts_labels))
+        acc_score[fold_id] = accuracy_score(labels[test_index], predicts_labels)
 
         for i in range(len(predicts_labels)):
-            true_labels[index, fold_id, i] = labels[y_test][i]
-            predictions[index, fold_id, i] = predicts_labels[i]
 
-        print(accuracy_score(y_test, predicts_labels))
-        model.save(f"model_{index}.model", save_format="h5")
+            true_labels[fold_id, i] = labels[test_index][i]
+            predictions[fold_id, i] = predicts_labels[i]
+
+    predicts_labelsPd = pd.DataFrame(predictions)
+    true_labelsPd = pd.DataFrame(true_labels)
+    acc_scorePd = pd.DataFrame(acc_score)
+
+    predicts_labelsPd.to_csv(f'Results\\Predicts\\predicts_{index}.csv', index=False)
+    true_labelsPd.to_csv(f'Results\\TrueLabels\\true_labels_{index}.csv', index=False)
+    acc_scorePd.to_csv(f'Results\\TrueLabels\\accurScore_{index}.csv', index=False)
+    model.save(f"model_{index}.model", save_format="h5")
 
 
 
